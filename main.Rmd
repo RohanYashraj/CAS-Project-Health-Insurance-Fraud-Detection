@@ -1,0 +1,2332 @@
+---
+title: "SSSIHL-CAS: Insurance Fraud Classifier for Health Insurance, a tool for fraud
+  detection"
+output:
+  pdf_document:
+    toc: true
+  html_notebook: null
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    collapsed: true
+    smooth_scroll: true
+---
+
+<style>
+.list-group-item.active, .list-group-item.active:focus, .list-group-item.active:hover {
+    background-color: yellow;
+    border-color: black;
+    color: black;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+# Suppress warnings, messages, prompts, and comments in code output for cleaner presentation
+knitr::opts_chunk$set(warning = F,message = F,prompt = F,comment = F)
+
+```
+
+
+# Project Summary
+
+> Objective:
+
+* This is a tool for insurance fraud detection and prevention using machine learning models. The tool is intended to augment any organizations current Fraud Detection Solution, giving ability to keep pace with the rapidly changing fraud   environment, while minimizing costs and increasing profitability.
+
+> Utility:
+
+* Red flagging claims for possible fraud and further investigation, thereby channelizing the investigation efforts to the   most important/prioritized suspected cases 
+* Reducing losses and increasing profitability for insurers / reinsurers 
+* Reducing premiums for customer's insurance cover 
+* Providing a competitive advantage for the insurers / reinsurers 
+
+
+# Cleaning the dataset
+
+## Loading required libraries
+
+```{r}
+# Load all required libraries for data manipulation, visualization, and machine learning
+library(readxl)        # For reading Excel files
+library(janitor)       # For data cleaning and hygiene
+library(dplyr)         # For data manipulation
+library(lubridate)     # For date/time operations
+library(caret)         # For machine learning workflows
+library(rpart)         # For decision trees
+library(rpart.plot)    # For decision tree visualization
+library(xgboost)       # For gradient boosting
+library(tidyverse)     # Core tidyverse packages
+library(randomForest)  # For random forest models
+library(pROC)          # For ROC curve analysis
+library(e1071)         # For statistical functions including SVM
+library(mlbench)       # For machine learning benchmark data
+library(naivebayes)    # For Naive Bayes classifier
+library(ggplot2)       # For data visualization
+library(psych)         # For psychological research tools
+library(gbm)           # For generalized boosted regression models
+library(caTools)       # For ROC curve calculations
+library(glmnet)        # For Lasso/Ridge regression
+library(bruceR)        # For data analysis and visualization
+library(kableExtra)    # For enhanced table formatting
+library(smotefamily)   # For SMOTE oversampling
+library(imbalance)     # For handling imbalanced datasets
+library(ROSE)          # For ROSE oversampling technique
+library(PRROC)         # For precision-recall curves
+library(ROCR)          # For ROC performance evaluation
+
+```
+
+
+# Preparing Input data without triggers
+
+## Loading data and Reducing dimensionality of character columns
+
+```{r}
+# Load pre-cleaned input dataset
+clean_data1 = readRDS("./data/raw/cleaned_input_data.rds")
+
+## Considering top 20 unique values from certain columns with large unique values 
+
+# medical service provider id - aggregate counts to identify top providers
+mspid <- 
+clean_data1 %>% 
+  group_by(medical_service_provider_id) %>% 
+  count() %>% 
+  arrange(desc(n))
+
+# Calculate coverage percentage of top 20 providers
+sum(mspid[1:20,2])/sum(mspid[,2])
+
+# removing features that do not contribute in predicting fraud
+# Focus on top 20 providers and group others, remove ID columns and date fields
+data_wo_triggers <-
+  clean_data1 %>% 
+  mutate(medical_service_provider_id = 
+           ifelse(medical_service_provider_id %in% mspid[1:20,1]$medical_service_provider_id,
+                  medical_service_provider_id, 
+                  "Others" )) %>% 
+  dplyr::select(-c(insured_id, primary_diagnosis_code,treatment_start_date,treatment_end_date,policy_commencement_date,policy_termination_date,claim_reported_date,claim_count_pa))
+
+
+
+```
+
+
+## Feature scaling
+
+```{r}
+# Scale/normalize numerical features to comparable ranges
+k = c("approved_allowed_amount","no_of_days_stayed","birth_date")
+data_wo_triggers[k] = scaler(data_wo_triggers[k])
+
+# Save processed dataset for future use
+write_rds(data_wo_triggers,"./data/interim/data_wo_triggers.rds",compress = "bz2",compression = 9)
+
+# Display preview of processed data in formatted table
+kable(head(data_wo_triggers) , caption = "Data_wo_triggers")%>%
+  kable_styling(bootstrap_options = "striped", "hover", "condensed", "responsive", full_width = F, position = "center") %>% 
+ row_spec(0, bold = T, color = "black", background = "yellow") %>% 
+ scroll_box( height = "900px",fixed_thead = TRUE)
+
+```
+
+
+
+## Performing OneHot Encoding to Non-numeric columns
+
+```{r}
+# Convert categorical variables to binary dummy variables for machine learning compatibility
+dmy <- dummyVars(" ~ .", data = data_wo_triggers, fullRank = TRUE)
+data_wo_triggers <- data.frame(predict(dmy, newdata = data_wo_triggers))
+
+```
+
+
+## checking correlations of cloumns
+
+```{r}
+# Calculate correlation matrix to identify multicollinearity issues
+corr = cor(data_wo_triggers)
+
+# Simplify correlation matrix by zeroing upper triangle and diagonal
+corr[upper.tri(corr)] = 0
+diag(corr) = 0
+corr = as.data.frame(corr)
+corr = corr %>% tibble::rownames_to_column("colnames_1")
+piv = pivot_longer(corr,cols = -colnames_1,  names_to = "colnames", values_to = "correlation")
+piv = 
+  piv %>% 
+  mutate(correlation_1 = abs(correlation)) %>% 
+  arrange(desc(correlation_1)) %>% 
+  filter(correlation_1 !=0)
+#selecting features to drop that are highly correlated (threshold: 0.7)
+drop = as.vector(subset(piv, correlation_1 > 0.7 , select = colnames))
+data_wo_triggers = data_wo_triggers[,!(names(data_wo_triggers) %in% drop$colnames)]
+```
+
+
+### Lasso regression to remove non-influential features in predicting fraud
+```{r}
+
+#perform k-fold cross-validation to find optimal lambda value for Lasso regularization
+#Lasso (L1) helps select most important features by shrinking coefficients to zero
+cv_model <- cv.glmnet(data.matrix(data_wo_triggers %>% dplyr::select(-c("fraud"))), data_wo_triggers$fraud, alpha=1)
+
+
+#find optimal lambda value that minimizes test MSE
+best_lambda = cv_model$lambda.min
+
+#produce plot of test MSE by lambda value for visualization
+plot(cv_model)
+
+#find coefficients of best model and select only non-zero coefficients
+best_model<-glmnet(data.matrix(data_wo_triggers %>% dplyr::select(-c("fraud"))), data_wo_triggers$fraud, alpha = 1, lambda = best_lambda)
+k = as.matrix(coef(best_model))
+k = as.data.frame(k[-1,])
+k = k %>% rownames_to_column("feature")
+names(k)[names(k) == 'k[-1, ]'] <- 'coeff'
+# Keep only features with non-zero coefficients
+k = k[k$coeff!=0,]
+# Sort by absolute coefficient values to find most important features
+k = k[order(abs(k$coeff),decreasing = T),]
+# Limit to top 30 features if more were selected
+if(nrow(k)>30) k = k[1:30,]
+# Subset dataset to only selected important features
+data_wo_triggers = data_wo_triggers[,c(k$feature,"fraud")]
+```
+
+
+## Checking for class data Imbalance
+
+```{r}
+# Examine the distribution of fraud classes to identify imbalance issues
+summary(data_wo_triggers$fraud)
+barplot(prop.table(table(data_wo_triggers$fraud)),
+        col = rainbow(3),
+        ylim = c(0, 1),
+        main = "Class Distribution")
+
+
+```
+
+There is evidence to suggest the existence class data imbalance
+
+## SPlitting Train and Test set
+
+```{r}
+
+# randomly split data in r with 70-30 train-test ratio
+# Set seed for reproducibility
+set.seed(123)
+TrainingIndex = sample(seq_len(nrow(data_wo_triggers)),size = 0.7*nrow(data_wo_triggers))
+data_wo_triggers_train <- data_wo_triggers[TrainingIndex,] # Training Set
+data_wo_triggers_test <- data_wo_triggers[-TrainingIndex,] # Test Set
+```
+
+
+## Adjusting data for imbalance
+
+### ADASYN
+
+```{r}
+# Apply ADASYN (Adaptive Synthetic Sampling) to balance minority class
+# ADASYN focuses on generating samples for hard-to-learn minority class examples
+newData <- ADAS(X = data_wo_triggers_train,data_wo_triggers_train$fraud,K = 5)
+
+adasyn_wo_triggers_train <- newData$data %>% dplyr::select(-c("class"))
+
+
+# Save balanced training set for model comparison
+readr::write_rds(adasyn_wo_triggers_train,"./data/interim/adasyn_wo_triggers_train.rds", compress = "bz2", compression = 9)
+adasyn_wo_triggers_train$fraud = as.factor(adasyn_wo_triggers_train$fraud)
+# Display class distribution after balancing
+print(adasyn_wo_triggers_train %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+
+```{r}
+# Apply ADASYN to balance test set (for consistent evaluation)
+newData <- ADAS(X = data_wo_triggers_test,data_wo_triggers_test$fraud,K = 5)
+
+adasyn_wo_triggers_test <- newData$data %>% dplyr::select(-c("class"))
+
+# Save balanced test set
+readr::write_rds(adasyn_wo_triggers_test,"./data/interim/adasyn_wo_triggers_test.rds", compress = "bz2", compression = 9)
+adasyn_wo_triggers_test$fraud = as.factor(adasyn_wo_triggers_test$fraud)
+# Display class distribution after balancing
+print(adasyn_wo_triggers_test %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+### SMOTE
+
+```{r}
+# Calculate class imbalance ratio to determine oversampling needed
+nrow(data_wo_triggers_train)/sum(data_wo_triggers_train$fraud)
+
+# Apply SMOTE (Synthetic Minority Oversampling Technique) to balance classes
+# SMOTE creates synthetic samples by interpolating between minority class neighbors
+smote_wo_triggers_train <- SMOTE(data_wo_triggers_train,data_wo_triggers_train$fraud ,K = 5, dup_size = 18)$data %>% dplyr::select(-c("class"))
+
+# Save balanced training set
+readr::write_rds(smote_wo_triggers_train,"./data/interim/smote_wo_triggers_train.rds", compress = "bz2", compression = 9)
+
+#new SMOTE balanced data
+smote_wo_triggers_train$fraud = as.factor(smote_wo_triggers_train$fraud)
+# Verify class balance after SMOTE
+print(smote_wo_triggers_train %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+
+```{r}
+# Calculate imbalance ratio for test set
+nrow(data_wo_triggers_test)/sum(data_wo_triggers_test$fraud)
+
+# Apply SMOTE to balance test set for consistent evaluation
+smote_wo_triggers_test <- SMOTE(data_wo_triggers_test,data_wo_triggers_test$fraud ,K = 5, dup_size = 18)$data %>% dplyr::select(-c("class"))
+
+readr::write_rds(smote_wo_triggers_test,"./data/interim/smote_wo_triggers_test.rds", compress = "bz2", compression = 9)
+
+#new SMOTE balanced data
+smote_wo_triggers_test$fraud = as.factor(smote_wo_triggers_test$fraud)
+# Verify class balance after SMOTE
+print(smote_wo_triggers_test %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+
+### MWMOTE
+
+```{r}
+
+# Apply MWMOTE (Majority Weighted Minority Oversampling Technique)
+# MWMOTE identifies hard-to-learn minority samples and generates synthetic samples weighted by difficulty
+newData <- mwmote(dataset = data_wo_triggers_train,numInstances = nrow(data_wo_triggers_train)-2*sum(data_wo_triggers_train$fraud),classAttr = "fraud",kNoisy = 5,kMajority = 3,kMinority = 1,threshold = 5,cmax = 2,cclustering = 3)
+
+# Combine original data with synthetic samples
+mwmote_wo_triggers_train<-rbind(data_wo_triggers_train,newData)
+
+# Save balanced training set
+readr::write_rds(mwmote_wo_triggers_train,"./data/interim/mwmote_wo_triggers_train.rds", compress = "bz2", compression = 9)
+mwmote_wo_triggers_train$fraud = as.factor(mwmote_wo_triggers_train$fraud)
+# Display class distribution after MWMOTE balancing
+print(mwmote_wo_triggers_train %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+```{r}
+# Apply MWMOTE to balance test set for consistent evaluation
+newData <- mwmote(dataset = data_wo_triggers_test,numInstances = nrow(data_wo_triggers_test)-2*sum(data_wo_triggers_test$fraud),classAttr = "fraud",kNoisy = 5,kMajority = 3,kMinority = 1,threshold = 5,cmax = 2,cclustering = 3)
+
+mwmote_wo_triggers_test<-rbind(data_wo_triggers_test,newData)
+
+readr::write_rds(mwmote_wo_triggers_test,"./data/interim/mwmote_wo_triggers_test.rds", compress = "bz2", compression = 9)
+mwmote_wo_triggers_test$fraud = as.factor(mwmote_wo_triggers_test$fraud)
+# Display class distribution after MWMOTE balancing
+print(mwmote_wo_triggers_test %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+### ROSE
+
+```{r}
+# Apply ROSE (Random Over-Sampling Examples) for class balancing
+# ROSE generates synthetic data in the feature space around minority class observations
+#chose seed 100 for reproducibility
+#The N variable is the total number of samples that will be generated
+#N should essentially be sum of both fraud and non fraud classes
+rose_wo_triggers_train <- ovun.sample(fraud~. , data = data_wo_triggers_train, method = "over",N=(nrow(data_wo_triggers_train)-sum(data_wo_triggers_train$fraud))*2,seed = 100)$data
+
+# Save balanced training set
+readr::write_rds(rose_wo_triggers_train,"./data/interim/rose_wo_triggers_train.rds", compress = "bz2", compression = 9)
+rose_wo_triggers_train$fraud = as.factor(rose_wo_triggers_train$fraud)
+# Display and visualize class distribution after ROSE balancing
+table(rose_wo_triggers_train$fraud)
+barplot(prop.table(table(rose_wo_triggers_train$fraud)),
+        col = rainbow(3),
+        ylim = c(0, 1),
+        main = "Class Distribution")
+```
+
+
+
+```{r}
+# Apply ROSE to balance test set for consistent evaluation
+#chose seed 100 for reproducibility
+#The N variable is the total number that will be generated
+#N should essentially be sum of both fraud and non fraud classes
+rose_wo_triggers_test <- ovun.sample(fraud~. , data = data_wo_triggers_test, method = "over",N=(nrow(data_wo_triggers_test)-sum(data_wo_triggers_test$fraud))*2,seed = 100)$data
+
+readr::write_rds(rose_wo_triggers_test,"./data/interim/rose_wo_triggers_test.rds", compress = "bz2", compression = 9)
+rose_wo_triggers_test$fraud = as.factor(rose_wo_triggers_test$fraud)
+# Display and visualize class distribution after ROSE balancing
+table(rose_wo_triggers_test$fraud)
+barplot(prop.table(table(rose_wo_triggers_test$fraud)),
+        col = rainbow(3),
+        ylim = c(0, 1),
+        main = "Class Distribution")
+```
+
+
+# Preparing input dataset with triggers
+
+
+## Loading trigger functions
+
+```{r}
+# Load custom trigger functions for fraud detection heuristics
+source("./src/features/triggers for package.R")
+
+```
+
+
+## claim_amount_trigger_map
+
+```{r}
+# Apply trigger to flag claims exceeding expected package amounts by procedure code
+trigger_data <- read_excel("./data/external/trigger_table.xlsx")
+
+# Prepare trigger mapping data
+data <- 
+  trigger_data %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(primary_procedure_code, package_amount_trigger)
+
+# Map claim amounts against expected triggers to flag anomalies
+data_w_triggers <- claim_amount_trigger_map(claims_file = clean_data1,claim_paid_field = "approved_allowed_amount",triggers_file = data,procedure_code = "primary_procedure_code",procedure_amount_field = "package_amount_trigger")
+```
+
+
+## hosp_days_trigger_map
+
+```{r}
+# Apply trigger to flag excessive hospital stay durations by procedure code
+data <- 
+  trigger_data %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(primary_procedure_code, admission_days_trigger)
+data_w_triggers <- hosp_days_trigger_map(claims_file = data_w_triggers,no_of_days_stayed = "no_of_days_stayed",triggers_file = data,procedure_code = "primary_procedure_code",admission_days_trigger = "admission_days_trigger")
+```
+
+
+## age_trigger_map
+
+```{r}
+# Apply trigger to flag claims for procedures not appropriate for patient's age group
+
+data <- 
+  trigger_data %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(lower_age_limit, upper_age_limit, primary_procedure_code)
+
+data$primary_procedure_code <- as.character(data$primary_procedure_code)
+
+data_w_triggers <- age_trigger_map(claims_file = data_w_triggers,age_column_name = "birth_date",triggers_file = data,lower_age_limit = "lower_age_limit", upper_age_limit = "upper_age_limit",procedure_code = "primary_procedure_code")
+
+```
+
+## gender_trigger_map
+
+```{r}
+# Apply trigger to flag claims for gender-specific procedures claimed by wrong gender
+data <- 
+  trigger_data %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(primary_procedure_code, gender_trigger)
+
+data_w_triggers <- gender_trigger_map(claims_file = data_w_triggers,gender_column_name = "gender_code",triggers_file = data,procedure_code = "primary_procedure_code",gender_trigger = "gender_trigger")
+```
+
+
+## claim_count_trigger_map
+
+```{r}
+# Apply trigger to flag excessive claim frequency per annum by procedure code
+
+data <- 
+  trigger_data %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(primary_procedure_code, claim_count_trigger)
+
+data_w_triggers <- claim_count_trigger_map(claim_count = data_w_triggers,claim_count_pa = "claim_count_pa",claim_count_trigger_file = data,procedure_code_field = "primary_procedure_code",claim_count_trigger = "claim_count_trigger")
+```
+
+
+## close_prox_trigger_map
+
+```{r}
+# Apply trigger to flag claims filed too soon after policy commencement
+
+data <- 
+  trigger_data %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(primary_procedure_code, close_prox_days)
+
+data_w_triggers <-  close_prox_trigger_map(claims_file = data_w_triggers,treatment_start_date = "treatment_start_date",policy_commencement_date = "policy_commencement_date",triggers_file = data,procedure_code = "primary_procedure_code",close_prox_days = "close_prox_days")
+```
+
+
+## treatment_date_validity_trigger_map
+
+```{r}
+# Apply trigger to flag treatments outside policy coverage dates
+
+data_w_triggers <- treatment_date_validity_trigger_map(claims_file = data_w_triggers,treatment_start_date_field = "treatment_start_date",policy_commencement_date_field = "policy_commencement_date",policy_termination_date_field = "policy_termination_date")
+```
+
+
+## claim_reported_delay_trigger_map
+
+```{r}
+# Apply trigger to flag claims reported with significant delay (threshold: 15 days)
+
+data_w_triggers <- claim_reported_delay_trigger_map(claims_file = data_w_triggers,treatment_end_date_field = "treatment_end_date",claim_reported_date_field = "claim_reported_date",claim_delay_days = 15)
+```
+
+
+## hospital_empanelled_trigger_map
+
+```{r}
+# Apply trigger to flag treatments at non-empanelled hospitals
+data <- 
+  read_excel("./data/external/empanelled_hospitals_list_masked.xlsx") %>% 
+  janitor::clean_names() %>% 
+  dplyr::select(hosp_id)
+
+data_w_triggers <- hospital_empanelled_trigger_map(claims_file = data_w_triggers,hospital_id_field = "medical_service_provider_id",empanelled_hospitals_list = data,empanelled_hospital_id = "hosp_id")
+```
+
+
+
+## hospital_distance_trigger_map
+
+```{r}
+# Apply trigger to flag unusual travel distances to hospitals (threshold: 100 km)
+data <- 
+  read_excel("./data/external/district_distances_masked.xlsx") %>% 
+  tidyr::pivot_longer(cols=-"location_1",
+                      names_to = "location_2",
+                      values_to = "distance")
+
+data_w_triggers <- hospital_distance_trigger_map(claims_file = data_w_triggers,residence_location_field = "residence_location",hospital_location_field = "hospital_location",hospital_distance_file = data,residence_location_map = "location_1",hospital_location_map = "location_2",hospital_distance_field = "distance", distance_threshold = 100)
+```
+
+
+```{r}
+# Generate comprehensive summary statistics for dataset with all triggers applied
+skimr::skim(data_w_triggers)
+```
+
+
+# Preparing Input data with triggers
+
+## Reducing dimensionality of character columns
+
+```{r}
+## Considering top 20 unique values from certain columns with large unique values 
+
+# medical service provider id - aggregate to identify top providers in dataset with triggers
+mspid <- 
+data_w_triggers %>% 
+  group_by(medical_service_provider_id) %>% 
+  count() %>% 
+  arrange(desc(n))
+
+# Calculate what percentage of data is covered by top 20 providers
+sum(mspid[1:20,2])/sum(mspid[,2])
+
+# Reduce dimensionality by grouping less frequent providers together
+data_w_triggers <-
+  data_w_triggers %>% 
+  mutate(medical_service_provider_id = 
+           ifelse(medical_service_provider_id %in% mspid[1:20,1]$medical_service_provider_id,
+                  medical_service_provider_id, 
+                  "Others" )) %>% 
+  dplyr::select(-c(insured_id, primary_diagnosis_code,treatment_start_date,treatment_end_date,policy_commencement_date,policy_termination_date,claim_reported_date))
+
+
+```
+
+
+
+
+## Performing OneHot Encoding to Non-numeric columns
+
+```{r}
+# Convert categorical features to binary dummy variables for dataset with triggers
+dmy <- dummyVars(" ~ .", data = data_w_triggers, fullRank = TRUE)
+data_w_triggers <- data.frame(predict(dmy, newdata = data_w_triggers))
+```
+
+
+## Removing features with SD 0 and removing trigger information features
+```{r}
+# Remove auxiliary trigger columns, keeping only the derived flag indicators
+drop1 = c("package_amount_trigger","admission_days_trigger","lower_age_limit","upper_age_limit","age_flag","gender_triggerFemale","claim_count_trigger","close_prox_days","hospital_empanelled_flag","treatment_date_validity_flag")
+data_w_triggers = data_w_triggers %>% select(-c(drop1))
+```
+
+
+## Feature scaling
+
+```{r}
+# Scale numerical features including trigger-derived features for proper model training
+k = c("approved_allowed_amount","no_of_days_stayed","birth_date","claim_count_pa","claim_duration_days","distance")
+data_w_triggers[k] = scaler(data_w_triggers[k])
+
+# Display preview of processed data with triggers
+kable(head(data_w_triggers), caption = "data_w_triggers")%>%
+  kable_styling(bootstrap_options = "striped", "hover", "condensed", "responsive", full_width = F, position = "center") %>% 
+ row_spec(0, bold = T, color = "black", background = "yellow") %>% 
+ scroll_box( height = "900px",fixed_thead = TRUE)
+
+# Save processed dataset with triggers
+write_rds(data_w_triggers,"./data/interim/data_w_triggers.rds",compress = "bz2",compression = 9)
+```
+
+
+## Checking for class data Imbalance
+
+```{r}
+# Check fraud class distribution in dataset with triggers
+summary(data_w_triggers$fraud)
+barplot(prop.table(table(data_w_triggers$fraud)),
+        col = rainbow(3),
+        ylim = c(0, 1),
+        main = "Class Distribution")
+
+
+```
+
+
+## Splitting train and test data
+```{r}
+# Set seed for reproducibility and align feature sets between datasets
+set.seed(123)
+# Ensure same features plus trigger-derived features are used
+data_w_triggers = data_w_triggers[,c(colnames(data_wo_triggers),"claim_amount_flag","hosp_days_flag","gender_flag","claim_count_flag","close_prox_flag","distance","hospital_distance_flag","claim_duration_days","claim_reported_delay_flag")]
+
+# randomly split data in r with 70-30 train-test ratio
+TrainingIndex = sample(seq_len(nrow(data_w_triggers)),size = 0.7*nrow(data_w_triggers))
+data_w_triggers_train <- data_w_triggers[TrainingIndex,] # Training Set
+data_w_triggers_test <- data_w_triggers[-TrainingIndex,] # Test Set
+```
+
+
+
+## Adjusting data for imbalance
+
+### ADASYN
+
+```{r}
+# Apply ADASYN to dataset WITH trigger features for training set
+newData <- ADAS(X = data_w_triggers_train,data_w_triggers_train$fraud,K = 5)
+
+adasyn_w_triggers_train <- newData$data %>% dplyr::select(-c("class"))
+
+# Save balanced training set with triggers
+readr::write_rds(adasyn_w_triggers_train,"./data/interim/adasyn_w_triggers_train.rds", compress = "bz2", compression = 9)
+adasyn_w_triggers_train$fraud = as.factor(adasyn_w_triggers_train$fraud)
+# Display class distribution after balancing
+print(adasyn_w_triggers_train %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+```{r}
+# Apply ADASYN to dataset WITH trigger features for test set
+newData <- ADAS(X = data_w_triggers_test,data_w_triggers_test$fraud,K = 5)
+
+adasyn_w_triggers_test <- newData$data %>% dplyr::select(-c("class"))
+
+# Save balanced test set with triggers
+readr::write_rds(adasyn_w_triggers_test,"./data/interim/adasyn_w_triggers_test.rds", compress = "bz2", compression = 9)
+adasyn_w_triggers_test$fraud = as.factor(adasyn_w_triggers_test$fraud)
+# Display class distribution after balancing
+print(adasyn_w_triggers_test %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+### SMOTE
+
+```{r}
+# Calculate imbalance ratio for training set with triggers
+nrow(data_w_triggers_train)/sum(data_w_triggers_train$fraud)
+
+# Apply SMOTE to dataset WITH trigger features for training set
+smote_w_triggers_train <- SMOTE(data_w_triggers_train,data_w_triggers_train$fraud ,K = 5, dup_size = 18)$data %>% dplyr::select(-c("class"))
+
+readr::write_rds(smote_w_triggers_train,"./data/interim/smote_w_triggers_train.rds", compress = "bz2", compression = 9)
+
+#new SMOTE balanced data
+smote_w_triggers_train$fraud = as.factor(smote_w_triggers_train$fraud)
+# Verify class balance after SMOTE
+print(smote_w_triggers_train %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+
+```{r}
+# Calculate imbalance ratio for test set with triggers
+nrow(data_w_triggers_test)/sum(data_w_triggers_test$fraud)
+
+# Apply SMOTE to dataset WITH trigger features for test set
+smote_w_triggers_test <- SMOTE(data_w_triggers_test,data_w_triggers_test$fraud ,K = 5, dup_size = 18)$data %>% dplyr::select(-c("class"))
+
+readr::write_rds(smote_w_triggers_test,"./data/interim/smote_w_triggers_test.rds", compress = "bz2", compression = 9)
+
+#new SMOTE balanced data
+smote_w_triggers_test$fraud = as.factor(smote_w_triggers_test$fraud)
+# Verify class balance after SMOTE
+print(smote_w_triggers_test %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+
+### MWMOTE
+
+```{r}
+# Apply MWMOTE to dataset WITH trigger features for training set
+newData <- mwmote(dataset = data_w_triggers_train,numInstances = nrow(data_w_triggers_train)-2*sum(data_w_triggers_train$fraud),classAttr = "fraud",kNoisy = 5,kMajority = 3,kMinority = 1,threshold = 5,cmax = 2,cclustering = 3)
+
+mwmote_w_triggers_train<-rbind(data_w_triggers_train,newData)
+
+readr::write_rds(mwmote_w_triggers_train,"./data/interim/mwmote_w_triggers_train.rds", compress = "bz2", compression = 9)
+mwmote_w_triggers_train$fraud = as.factor(mwmote_w_triggers_train$fraud)
+# Display class distribution after MWMOTE balancing
+print(mwmote_w_triggers_train %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+```{r}
+# Apply MWMOTE to dataset WITH trigger features for test set
+newData <- mwmote(dataset = data_w_triggers_test,numInstances = nrow(data_w_triggers_test)-2*sum(data_w_triggers_test$fraud),classAttr = "fraud",kNoisy = 5,kMajority = 3,kMinority = 1,threshold = 5,cmax = 2,cclustering = 3)
+
+mwmote_w_triggers_test<-rbind(data_w_triggers_test,newData)
+
+readr::write_rds(mwmote_w_triggers_test,"./data/interim/mwmote_w_triggers_test.rds", compress = "bz2", compression = 9)
+mwmote_w_triggers_test$fraud = as.factor(mwmote_w_triggers_test$fraud)
+# Display class distribution after MWMOTE balancing
+print(mwmote_w_triggers_test %>% group_by(fraud) %>% summarise(count = n()))
+```
+
+
+### ROSE
+
+```{r}
+# Apply ROSE to dataset WITH trigger features for training set
+#chose seed 100 for reproducibility
+#The N variable is the total number that will be generated
+#N should essentially be sum of both fraud and non fraud classes
+rose_w_triggers_train <- ovun.sample(fraud~. , data = data_w_triggers_train, method = "over",N=(nrow(data_w_triggers_train)-sum(data_w_triggers_train$fraud))*2,seed = 100)$data
+
+readr::write_rds(rose_w_triggers_train,"./data/interim/rose_w_triggers_train.rds", compress = "bz2", compression = 9)
+rose_w_triggers_train$fraud = as.factor(rose_w_triggers_train$fraud)
+# Display and visualize class distribution after ROSE balancing
+table(rose_w_triggers_train$fraud)
+barplot(prop.table(table(rose_w_triggers_train$fraud)),
+        col = rainbow(3),
+        ylim = c(0, 1),
+        main = "Class Distribution")
+```
+
+
+
+```{r}
+# Apply ROSE to dataset WITH trigger features for test set
+#chose seed 100 for reproducibility
+#The N variable is the total number that will be generated
+#N should essentially be sum of both fraud and non fraud classes
+rose_w_triggers_test <- ovun.sample(fraud~. , data = data_w_triggers_test, method = "over",N=(nrow(data_w_triggers_test)-sum(data_w_triggers_test$fraud))*2,seed = 100)$data
+
+readr::write_rds(rose_w_triggers_test,"./data/interim/rose_w_triggers_test.rds", compress = "bz2", compression = 9)
+rose_w_triggers_test$fraud = as.factor(rose_w_triggers_test$fraud)
+# Display and visualize class distribution after ROSE balancing
+table(rose_w_triggers_test$fraud)
+barplot(prop.table(table(rose_w_triggers_test$fraud)),
+        col = rainbow(3),
+        ylim = c(0, 1),
+        main = "Class Distribution")
+```
+
+
+# ML Model fit comparisons
+
+This section compares multiple machine learning models (Decision Tree, Random Forest, XGBoost, GLM, Naive Bayes, GBM) across different data balancing techniques (ADASYN, SMOTE, MWMOTE, ROSE) with and without trigger features. Each model is evaluated using ROC-AUC, PR-AUC, and classification metrics.
+
+## Decision Tree
+
+### ADASYN
+
+```{r}
+# Train decision tree classifier on ADASYN-balanced data
+tree <- rpart(fraud ~ ., data = adasyn_wo_triggers_train, method = 'class', minsplit = 5)
+# Generate probability predictions on test set
+tree.pred <- predict(tree, adasyn_wo_triggers_test %>% dplyr::select(-c("fraud")), type = "prob")[, 2]
+roc_obj <- roc(adasyn_wo_triggers_test$fraud, tree.pred)
+# Determine optimal classification threshold from ROC curve
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(tree.pred > threshold, 1, 0)
+
+# Calculate performance metrics and store results
+c <- confusionMatrix(as.factor(tree.pred), adasyn_wo_triggers_test$fraud, mode = "everything", positive = "1")
+c <- rbind(c, c("DT adasyn_wo_triggers_train", c$overall[1], c$byClass[c(1,2,5,6,7)], roc_obj$auc, pr.curve(tree.pred, adasyn_wo_triggers_test$fraud)$auc.integral))
+c = c[-1,]
+# Visualize decision tree structure
+rpart.plot(tree, extra = 101)
+
+```
+
+
+```{r}
+# Train decision tree on ADASYN-balanced data WITH trigger features
+tree <- rpart(fraud~., data = adasyn_w_triggers_train, method = 'class',minsplit = 5)
+tree.pred = predict(tree,adasyn_w_triggers_test %>% dplyr::select(-c("fraud") ),type = "prob")[,2]
+roc_obj <- roc(adasyn_w_triggers_test$fraud, tree.pred)
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(tree.pred > threshold, 1, 0)
+
+# Calculate and store performance metrics
+c1 = confusionMatrix(as.factor(tree.pred),adasyn_w_triggers_test$fraud,mode = "everything",positive = "1")
+c = rbind(c,c("DT adasyn_w_triggers_train",c1$overall[1],c1$byClass[c(1,2,5,6,7)],roc_obj$auc,pr.curve(tree.pred, adasyn_w_triggers_test$fraud)$auc.integral))
+rm(c1)
+
+rpart.plot(tree, extra = 101)
+
+
+```
+
+
+
+### SMOTE
+
+```{r}
+# Train decision tree on SMOTE-balanced data WITHOUT trigger features
+tree <- rpart(fraud~., data = smote_wo_triggers_train, method = 'class',minsplit = 5)
+tree.pred = predict(tree,smote_wo_triggers_test %>% dplyr::select(-c("fraud") ),type = "prob")[,2]
+roc_obj <- roc(smote_wo_triggers_test$fraud, tree.pred)
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(tree.pred > threshold, 1, 0)
+
+# Calculate and store performance metrics
+c1 = confusionMatrix(as.factor(tree.pred),smote_wo_triggers_test$fraud,mode = "everything",positive = "1")
+c = rbind(c,c("DT smote_wo_triggers_train",c1$overall[1],c1$byClass[c(1,2,5,6,7)],roc_obj$auc,pr.curve(tree.pred, smote_wo_triggers_test$fraud)$auc.integral))
+rm(c1)
+
+rpart.plot(tree, extra = 101)
+
+```
+
+
+```{r}
+# Train decision tree on SMOTE-balanced data WITH trigger features
+tree <- rpart(fraud~., data = smote_w_triggers_train, method = 'class',minsplit = 5)
+tree.pred = predict(tree,smote_w_triggers_test %>% dplyr::select(-c("fraud") ),type = "prob")[,2]
+roc_obj <- roc(smote_w_triggers_test$fraud, tree.pred)
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(tree.pred > threshold, 1, 0)
+
+# Calculate and store performance metrics
+c1 = confusionMatrix(as.factor(tree.pred),smote_w_triggers_test$fraud,mode = "everything",positive = "1")
+c = rbind(c,c("DT smote_w_triggers_train",c1$overall[1],c1$byClass[c(1,2,5,6,7)],roc_obj$auc,pr.curve(tree.pred, smote_w_triggers_test$fraud)$auc.integral))
+rm(c1)
+
+rpart.plot(tree, extra = 101)
+
+```
+
+
+### MWMOTE
+
+```{r}
+# Train decision tree on MWMOTE-balanced data WITHOUT trigger features
+tree <- rpart(fraud~., data = mwmote_wo_triggers_train, method = 'class',minsplit = 5)
+tree.pred = predict(tree,mwmote_wo_triggers_test %>% dplyr::select(-c("fraud") ),type = "prob")[,2]
+roc_obj <- roc(mwmote_wo_triggers_test$fraud, tree.pred)
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(tree.pred > threshold, 1, 0)
+
+# Calculate and store performance metrics
+c1 = confusionMatrix(as.factor(tree.pred),mwmote_wo_triggers_test$fraud,mode = "everything",positive = "1")
+c = rbind(c,c("DT mwmote_wo_triggers_train",c1$overall[1],c1$byClass[c(1,2,5,6,7)],roc_obj$auc,pr.curve(tree.pred, mwmote_wo_triggers_test$fraud)$auc.integral))
+rm(c1)
+
+rpart.plot(tree, extra = 101)
+
+```
+
+
+```{r}
+# Train decision tree on MWMOTE-balanced data WITH trigger features
+tree <- rpart(fraud~., data = mwmote_w_triggers_train, method = 'class',minsplit = 5)
+tree.pred = predict(tree,mwmote_w_triggers_test %>% dplyr::select(-c("fraud") ),type = "prob")[,2]
+roc_obj <- roc(mwmote_w_triggers_test$fraud, tree.pred)
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(tree.pred > threshold, 1, 0)
+
+# Calculate and store performance metrics
+c1 = confusionMatrix(as.factor(tree.pred),mwmote_w_triggers_test$fraud,mode = "everything",positive = "1")
+c = rbind(c,c("DT mwmote_w_triggers_train",c1$overall[1],c1$byClass[c(1,2,5,6,7)],roc_obj$auc,pr.curve(tree.pred, mwmote_w_triggers_test$fraud)$auc.integral))
+rm(c1)
+
+rpart.plot(tree, extra = 101)
+
+
+```
+
+
+### ROSE
+
+```{r}
+# Train decision tree on ROSE-balanced data WITHOUT trigger features
+tree <- rpart(fraud~., data = rose_wo_triggers_train, method = 'class',minsplit = 5)
+tree.pred = predict(tree,rose_wo_triggers_test %>% dplyr::select(-c("fraud") ),type = "prob")[,2]
+roc_obj <- roc(rose_wo_triggers_test$fraud, tree.pred)
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(tree.pred > threshold, 1, 0)
+
+# Calculate and store performance metrics
+c1 = confusionMatrix(as.factor(tree.pred),rose_wo_triggers_test$fraud,mode = "everything",positive = "1")
+c = rbind(c,c("DT rose_wo_triggers_train",c1$overall[1],c1$byClass[c(1,2,5,6,7)],roc_obj$auc,pr.curve(tree.pred, rose_wo_triggers_test$fraud)$auc.integral))
+rm(c1)
+
+rpart.plot(tree, extra = 101)
+
+```
+
+
+```{r}
+# Train decision tree on ROSE-balanced data WITH trigger features
+tree <- rpart(fraud~., data = rose_w_triggers_train, method = 'class',minsplit = 5)
+tree.pred = predict(tree,rose_w_triggers_test %>% dplyr::select(-c("fraud") ),type = "prob")[,2]
+roc_obj <- roc(rose_w_triggers_test$fraud, tree.pred)
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(tree.pred > threshold, 1, 0)
+
+# Calculate and store performance metrics
+c1 = confusionMatrix(as.factor(tree.pred),rose_w_triggers_test$fraud,mode = "everything",positive = "1")
+c = rbind(c,c("DT rose_w_triggers_train",c1$overall[1],c1$byClass[c(1,2,5,6,7)],roc_obj$auc,pr.curve(tree.pred, rose_w_triggers_test$fraud)$auc.integral))
+rm(c1)
+
+rpart.plot(tree, extra = 101)
+
+
+```
+
+
+## Random Forest
+
+
+### ADASYN
+
+```{r}
+# train the random forest model
+classifier_rf <- randomForest(fraud ~ ., data = adasyn_wo_triggers_train, ntree = 100)
+
+# predict probabilities on the test set
+y_prob <- predict(classifier_rf, newdata = adasyn_wo_triggers_test, type = "prob")[,2]
+
+# calculate ROC AUC and PR AUC
+roc_obj <- roc(adasyn_wo_triggers_test$fraud, y_prob)
+pr_obj <- pr.curve(scores.class0 = y_prob, weights.class0 = ifelse(adasyn_wo_triggers_test$fraud == "1", 1, 0))
+
+# determine threshold using ROC curve
+threshold <- coords(roc_obj, "best")[[1]]
+
+# classify test set based on threshold
+y_pred <- ifelse(y_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(adasyn_wo_triggers_test$fraud, as.factor(y_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("RF adasyn_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_obj$auc, pr_obj$auc.integral))
+
+rm(c1)
+  
+# Plotting model
+plot(classifier_rf)
+  
+# Importance plot
+importance(classifier_rf)
+  
+# Variable importance plot
+varImpPlot(classifier_rf,top= 10)
+```
+
+
+
+```{r}
+# train the random forest model
+classifier_rf <- randomForest(fraud ~ ., data = adasyn_w_triggers_train, ntree = 100)
+
+# predict probabilities on the test set
+y_prob <- predict(classifier_rf, newdata = adasyn_w_triggers_test, type = "prob")[,2]
+
+# calculate ROC AUC and PR AUC
+roc_obj <- roc(adasyn_w_triggers_test$fraud, y_prob)
+pr_obj <- pr.curve(scores.class0 = y_prob, weights.class0 = ifelse(adasyn_w_triggers_test$fraud == "1", 1, 0))
+
+# determine threshold using ROC curve
+threshold <- coords(roc_obj, "best")[[1]]
+
+# classify test set based on threshold
+y_pred <- ifelse(y_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(adasyn_w_triggers_test$fraud, as.factor(y_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("RF adasyn_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_obj$auc, pr_obj$auc.integral))
+
+rm(c1)
+
+  
+# Plotting model
+plot(classifier_rf)
+  
+# Importance plot
+importance(classifier_rf)
+  
+# Variable importance plot
+varImpPlot(classifier_rf,top= 10)
+```
+
+
+### SMOTE
+
+```{r}
+# train the random forest model
+classifier_rf <- randomForest(fraud ~ ., data = smote_wo_triggers_train, ntree = 100)
+
+# predict probabilities on the test set
+y_prob <- predict(classifier_rf, newdata = smote_wo_triggers_test, type = "prob")[,2]
+
+# calculate ROC AUC and PR AUC
+roc_obj <- roc(smote_wo_triggers_test$fraud, y_prob)
+pr_obj <- pr.curve(scores.class0 = y_prob, weights.class0 = ifelse(smote_wo_triggers_test$fraud == "1", 1, 0))
+
+# determine threshold using ROC curve
+threshold <- coords(roc_obj, "best")[[1]]
+
+# classify test set based on threshold
+y_pred <- ifelse(y_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(smote_wo_triggers_test$fraud, as.factor(y_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("RF smote_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_obj$auc, pr_obj$auc.integral))
+rm(c1)
+
+# Plotting model
+plot(classifier_rf)
+  
+# Importance plot
+importance(classifier_rf)
+  
+# Variable importance plot
+varImpPlot(classifier_rf,top= 10)
+```
+
+
+
+```{r}
+# train the random forest model
+classifier_rf <- randomForest(fraud ~ ., data = smote_w_triggers_train, ntree = 100)
+
+# predict probabilities on the test set
+y_prob <- predict(classifier_rf, newdata = smote_w_triggers_test, type = "prob")[,2]
+
+# calculate ROC AUC and PR AUC
+roc_obj <- roc(smote_w_triggers_test$fraud, y_prob)
+pr_obj <- pr.curve(scores.class0 = y_prob, weights.class0 = ifelse(smote_w_triggers_test$fraud == "1", 1, 0))
+
+# determine threshold using ROC curve
+threshold <- coords(roc_obj, "best")[[1]]
+
+# classify test set based on threshold
+y_pred <- ifelse(y_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(smote_w_triggers_test$fraud, as.factor(y_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("RF smote_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_obj$auc, pr_obj$auc.integral))
+
+rm(c1)
+# Plotting model
+plot(classifier_rf)
+  
+# Importance plot
+importance(classifier_rf)
+  
+# Variable importance plot
+varImpPlot(classifier_rf,top= 10)
+```
+
+
+### MWMOTE
+
+```{r}
+# train the random forest model
+classifier_rf <- randomForest(fraud ~ ., data = mwmote_wo_triggers_train, ntree = 100)
+
+# predict probabilities on the test set
+y_prob <- predict(classifier_rf, newdata = mwmote_wo_triggers_test, type = "prob")[,2]
+
+# calculate ROC AUC and PR AUC
+roc_obj <- roc(mwmote_wo_triggers_test$fraud, y_prob)
+pr_obj <- pr.curve(scores.class0 = y_prob, weights.class0 = ifelse(mwmote_wo_triggers_test$fraud == "1", 1, 0))
+
+# determine threshold using ROC curve
+threshold <- coords(roc_obj, "best")[[1]]
+
+# classify test set based on threshold
+y_pred <- ifelse(y_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(mwmote_wo_triggers_test$fraud, as.factor(y_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("RF mwmote_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_obj$auc, pr_obj$auc.integral))
+
+rm(c1)  
+# Plotting model
+plot(classifier_rf)
+  
+# Importance plot
+importance(classifier_rf)
+  
+# Variable importance plot
+varImpPlot(classifier_rf,top= 10)
+```
+
+
+
+```{r}
+# train the random forest model
+classifier_rf <- randomForest(fraud ~ ., data = mwmote_w_triggers_train, ntree = 100)
+
+# predict probabilities on the test set
+y_prob <- predict(classifier_rf, newdata = mwmote_w_triggers_test, type = "prob")[,2]
+
+# calculate ROC AUC and PR AUC
+roc_obj <- roc(mwmote_w_triggers_test$fraud, y_prob)
+pr_obj <- pr.curve(scores.class0 = y_prob, weights.class0 = ifelse(mwmote_w_triggers_test$fraud == "1", 1, 0))
+
+# determine threshold using ROC curve
+threshold <- coords(roc_obj, "best")[[1]]
+
+# classify test set based on threshold
+y_pred <- ifelse(y_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(mwmote_w_triggers_test$fraud, as.factor(y_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("RF mwmote_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_obj$auc, pr_obj$auc.integral))
+
+rm(c1)  
+  
+# Plotting model
+plot(classifier_rf)
+  
+# Importance plot
+importance(classifier_rf)
+  
+# Variable importance plot
+varImpPlot(classifier_rf,top= 10)
+```
+
+
+### ROSE
+
+```{r}
+# train the random forest model
+classifier_rf <- randomForest(fraud ~ ., data = rose_wo_triggers_train, ntree = 100)
+
+# predict probabilities on the test set
+y_prob <- predict(classifier_rf, newdata = rose_wo_triggers_test, type = "prob")[,2]
+
+# calculate ROC AUC and PR AUC
+roc_obj <- roc(rose_wo_triggers_test$fraud, y_prob)
+pr_obj <- pr.curve(scores.class0 = y_prob, weights.class0 = ifelse(rose_wo_triggers_test$fraud == "1", 1, 0))
+
+# determine threshold using ROC curve
+threshold <- coords(roc_obj, "best")[[1]]
+
+# classify test set based on threshold
+y_pred <- ifelse(y_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(rose_wo_triggers_test$fraud, as.factor(y_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("RF rose_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_obj$auc, pr_obj$auc.integral))
+
+rm(c1)  
+  
+# Plotting model
+plot(classifier_rf)
+  
+# Importance plot
+importance(classifier_rf)
+  
+# Variable importance plot
+varImpPlot(classifier_rf,top= 10)
+```
+
+
+
+```{r}
+# train the random forest model
+classifier_rf <- randomForest(fraud ~ ., data = rose_w_triggers_train, ntree = 100)
+
+# predict probabilities on the test set
+y_prob <- predict(classifier_rf, newdata = rose_w_triggers_test, type = "prob")[,2]
+
+# calculate ROC AUC and PR AUC
+roc_obj <- roc(rose_w_triggers_test$fraud, y_prob)
+pr_obj <- pr.curve(scores.class0 = y_prob, weights.class0 = ifelse(rose_w_triggers_test$fraud == "1", 1, 0))
+
+# determine threshold using ROC curve
+threshold <- coords(roc_obj, "best")[[1]]
+
+# classify test set based on threshold
+y_pred <- ifelse(y_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(rose_w_triggers_test$fraud, as.factor(y_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("RF rose_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_obj$auc, pr_obj$auc.integral))
+
+rm(c1)  
+  
+# Plotting model
+plot(classifier_rf)
+  
+# Importance plot
+importance(classifier_rf)
+  
+# Variable importance plot
+varImpPlot(classifier_rf,top= 10)
+```
+
+
+
+## XG Boost
+
+### ADASYN
+
+```{r}
+library(xgboost) # for xgboost
+
+# Convert the data to DMatrix format
+dtrain <- xgb.DMatrix(data = data.matrix(adasyn_wo_triggers_train %>% dplyr::select(-c(fraud))), label= adasyn_wo_triggers_train$fraud)
+dtest <- xgb.DMatrix(data = data.matrix(adasyn_wo_triggers_test%>% dplyr::select(-c(fraud))), label= adasyn_wo_triggers_test$fraud)
+
+# Train the model
+model <- xgb.train(data = dtrain, nrounds = 15)
+
+# Use the model to make predictions on test data
+pred_y <- predict(model, dtest)
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(adasyn_wo_triggers_test$fraud, pred_y)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(adasyn_wo_triggers_test$fraud, pred_y)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(pred_y > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(adasyn_wo_triggers_test$fraud, as.factor(tree.pred), mode = "everything", positive = "1")
+c <- rbind(c, c("XGB adasyn_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+xgb.plot.importance(xgb.importance(names(adasyn_wo_triggers_train %>% dplyr::select(-c("fraud"))),model = model))
+
+```
+
+
+```{r}
+
+# Convert the data to DMatrix format
+dtrain <- xgb.DMatrix(data = data.matrix(adasyn_w_triggers_train %>% dplyr::select(-c(fraud))), label= adasyn_w_triggers_train$fraud)
+dtest <- xgb.DMatrix(data = data.matrix(adasyn_w_triggers_test%>% dplyr::select(-c(fraud))), label= adasyn_w_triggers_test$fraud)
+
+# Train the model
+model <- xgb.train(data = dtrain, nrounds = 15)
+
+# Use the model to make predictions on test data
+pred_y <- predict(model, dtest)
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(adasyn_w_triggers_test$fraud, pred_y)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(adasyn_w_triggers_test$fraud, pred_y)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(pred_y > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(adasyn_w_triggers_test$fraud, as.factor(tree.pred), mode = "everything", positive = "1")
+c <- rbind(c, c("XGB adasyn_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+
+rm(c1)
+
+xgb.plot.importance(xgb.importance(names(adasyn_w_triggers_train %>% dplyr::select(-c("fraud"))),model = model))
+
+```
+
+### SMOTE
+
+```{r}
+# Convert the data to DMatrix format
+dtrain <- xgb.DMatrix(data = data.matrix(smote_wo_triggers_train %>% dplyr::select(-c(fraud))), label= smote_wo_triggers_train$fraud)
+dtest <- xgb.DMatrix(data = data.matrix(smote_wo_triggers_test%>% dplyr::select(-c(fraud))), label= smote_wo_triggers_test$fraud)
+
+# Train the model
+model <- xgb.train(data = dtrain, nrounds = 15)
+
+# Use the model to make predictions on test data
+pred_y <- predict(model, dtest)
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(smote_wo_triggers_test$fraud, pred_y)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(smote_wo_triggers_test$fraud, pred_y)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(pred_y > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(smote_wo_triggers_test$fraud, as.factor(tree.pred), mode = "everything", positive = "1")
+c <- rbind(c, c("XGB smote_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+xgb.plot.importance(xgb.importance(names(smote_wo_triggers_train %>% dplyr::select(-c("fraud"))),model = model))
+
+```
+
+
+```{r}
+# Convert the data to DMatrix format
+dtrain <- xgb.DMatrix(data = data.matrix(smote_w_triggers_train %>% dplyr::select(-c(fraud))), label= smote_w_triggers_train$fraud)
+dtest <- xgb.DMatrix(data = data.matrix(smote_w_triggers_test%>% dplyr::select(-c(fraud))), label= smote_w_triggers_test$fraud)
+
+# Train the model
+model <- xgb.train(data = dtrain, nrounds = 15)
+
+# Use the model to make predictions on test data
+pred_y <- predict(model, dtest)
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(smote_w_triggers_test$fraud, pred_y)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(smote_w_triggers_test$fraud, pred_y)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(pred_y > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(smote_w_triggers_test$fraud, as.factor(tree.pred), mode = "everything", positive = "1")
+c <- rbind(c, c("XGB smote_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+xgb.plot.importance(xgb.importance(names(smote_w_triggers_train %>% dplyr::select(-c("fraud"))),model = model))
+
+```
+
+### MWMOTE
+
+```{r}
+# Convert the data to DMatrix format
+dtrain <- xgb.DMatrix(data = data.matrix(mwmote_wo_triggers_train %>% dplyr::select(-c(fraud))), label= mwmote_wo_triggers_train$fraud)
+dtest <- xgb.DMatrix(data = data.matrix(mwmote_wo_triggers_test%>% dplyr::select(-c(fraud))), label= mwmote_wo_triggers_test$fraud)
+
+# Train the model
+model <- xgb.train(data = dtrain, nrounds = 15)
+
+# Use the model to make predictions on test data
+pred_y <- predict(model, dtest)
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(mwmote_wo_triggers_test$fraud, pred_y)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(mwmote_wo_triggers_test$fraud, pred_y)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(pred_y > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(mwmote_wo_triggers_test$fraud, as.factor(tree.pred), mode = "everything", positive = "1")
+c <- rbind(c, c("XGB mwmote_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+xgb.plot.importance(xgb.importance(names(mwmote_wo_triggers_train %>% dplyr::select(-c("fraud"))),model = model))
+
+```
+
+
+```{r}
+# Convert the data to DMatrix format
+dtrain <- xgb.DMatrix(data = data.matrix(mwmote_w_triggers_train %>% dplyr::select(-c(fraud))), label= mwmote_w_triggers_train$fraud)
+dtest <- xgb.DMatrix(data = data.matrix(mwmote_w_triggers_test%>% dplyr::select(-c(fraud))), label= mwmote_w_triggers_test$fraud)
+
+# Train the model
+model <- xgb.train(data = dtrain, nrounds = 15)
+
+# Use the model to make predictions on test data
+pred_y <- predict(model, dtest)
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(mwmote_w_triggers_test$fraud, pred_y)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(mwmote_w_triggers_test$fraud, pred_y)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(pred_y > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(mwmote_w_triggers_test$fraud, as.factor(tree.pred), mode = "everything", positive = "1")
+c <- rbind(c, c("XGB mwmote_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+xgb.plot.importance(xgb.importance(names(mwmote_w_triggers_train %>% dplyr::select(-c("fraud"))),model = model))
+
+```
+
+### ROSE
+
+```{r}
+# Convert the data to DMatrix format
+dtrain <- xgb.DMatrix(data = data.matrix(rose_wo_triggers_train %>% dplyr::select(-c(fraud))), label= rose_wo_triggers_train$fraud)
+dtest <- xgb.DMatrix(data = data.matrix(rose_wo_triggers_test%>% dplyr::select(-c(fraud))), label= rose_wo_triggers_test$fraud)
+
+# Train the model
+model <- xgb.train(data = dtrain, nrounds = 15)
+
+# Use the model to make predictions on test data
+pred_y <- predict(model, dtest)
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(rose_wo_triggers_test$fraud, pred_y)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(rose_wo_triggers_test$fraud, pred_y)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(pred_y > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(rose_wo_triggers_test$fraud, as.factor(tree.pred), mode = "everything", positive = "1")
+c <- rbind(c, c("XGB rose_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+xgb.plot.importance(xgb.importance(names(rose_wo_triggers_train %>% dplyr::select(-c("fraud"))),model = model))
+
+
+```
+
+
+```{r}
+# Convert the data to DMatrix format
+dtrain <- xgb.DMatrix(data = data.matrix(rose_w_triggers_train %>% dplyr::select(-c(fraud))), label= rose_w_triggers_train$fraud)
+dtest <- xgb.DMatrix(data = data.matrix(rose_w_triggers_test%>% dplyr::select(-c(fraud))), label= rose_w_triggers_test$fraud)
+
+# Train the model
+model <- xgb.train(data = dtrain, nrounds = 15)
+
+# Use the model to make predictions on test data
+pred_y <- predict(model, dtest)
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(rose_w_triggers_test$fraud, pred_y)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(rose_w_triggers_test$fraud, pred_y)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+tree.pred <- ifelse(pred_y > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(rose_w_triggers_test$fraud, as.factor(tree.pred), mode = "everything", positive = "1")
+c <- rbind(c, c("XGB rose_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+xgb.plot.importance(xgb.importance(names(rose_w_triggers_train %>% dplyr::select(-c("fraud"))),model = model))
+
+```
+
+## GLM
+
+### ADASYN
+
+
+```{r}
+
+
+# Fit the GLM model
+fit <- glm(fraud ~ ., data = adasyn_wo_triggers_train, family = binomial(link = "logit"))
+
+# Testing Set
+test_prob <- predict(fit, newdata = adasyn_wo_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(adasyn_wo_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(adasyn_wo_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_glm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(adasyn_wo_triggers_test$fraud, as.factor(model_glm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GLM adasyn_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+
+```
+
+
+```{r}
+
+# Fit the GLM model
+fit <- glm(fraud ~ ., data = adasyn_w_triggers_train, family = binomial(link = "logit"))
+
+# Testing Set
+test_prob <- predict(fit, newdata = adasyn_w_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(adasyn_w_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(adasyn_w_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_glm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(adasyn_w_triggers_test$fraud, as.factor(model_glm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GLM adasyn_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+### SMOTE
+
+```{r}
+
+# Fit the GLM model
+fit <- glm(fraud ~ ., data = smote_wo_triggers_train, family = binomial(link = "logit"))
+
+# Testing Set
+test_prob <- predict(fit, newdata = smote_wo_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(smote_wo_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(smote_wo_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_glm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(smote_wo_triggers_test$fraud, as.factor(model_glm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GLM smote_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+```{r}
+
+# Fit the GLM model
+fit <- glm(fraud ~ ., data = smote_w_triggers_train, family = binomial(link = "logit"))
+
+# Testing Set
+test_prob <- predict(fit, newdata = smote_w_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(smote_w_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(smote_w_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_glm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(smote_w_triggers_test$fraud, as.factor(model_glm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GLM smote_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+
+### MWMOTE
+
+
+```{r}
+
+# Fit the GLM model
+fit <- glm(fraud ~ ., data = mwmote_wo_triggers_train, family = binomial(link = "logit"))
+
+# Testing Set
+test_prob <- predict(fit, newdata = mwmote_wo_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(mwmote_wo_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(mwmote_wo_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_glm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(mwmote_wo_triggers_test$fraud, as.factor(model_glm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GLM mwmote_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+```{r}
+
+# Fit the GLM model
+fit <- glm(fraud ~ ., data = mwmote_w_triggers_train, family = binomial(link = "logit"))
+
+# Testing Set
+test_prob <- predict(fit, newdata = mwmote_w_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(mwmote_w_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(mwmote_w_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_glm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(mwmote_w_triggers_test$fraud, as.factor(model_glm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GLM mwmote_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+
+test_prob = predict(fit, newdata = mwmote_w_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+test_roc = roc(mwmote_w_triggers_test$fraud ~ test_prob, plot = TRUE, print.auc = TRUE)
+
+```
+
+
+### ROSE
+
+```{r}
+
+
+# Fit the GLM model
+fit <- glm(fraud ~ ., data = rose_wo_triggers_train, family = binomial(link = "logit"))
+
+# Testing Set
+test_prob <- predict(fit, newdata = rose_wo_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(rose_wo_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(rose_wo_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_glm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(rose_wo_triggers_test$fraud, as.factor(model_glm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GLM rose_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+
+test_prob = predict(fit, newdata = rose_wo_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+
+test_roc = roc(rose_wo_triggers_test$fraud ~ test_prob, plot = TRUE, print.auc = TRUE)
+
+```
+
+
+```{r}
+
+
+# Fit the GLM model
+fit <- glm(fraud ~ ., data = rose_w_triggers_train, family = binomial(link = "logit"))
+
+# Testing Set
+test_prob <- predict(fit, newdata = rose_w_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(rose_w_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(rose_w_triggers_test$fraud, test_prob,curve = T)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_glm_test_pred <- ifelse(test_prob > mean(test_prob), 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(rose_w_triggers_test$fraud, as.factor(model_glm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GLM rose_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+test_prob = predict(fit, newdata = rose_w_triggers_test %>% dplyr::select(-c("fraud")), type = "response")
+test_roc = roc(rose_w_triggers_test$fraud ~ test_prob, plot = TRUE, print.auc = TRUE)
+
+```
+
+
+## Naive Bayes Classifier
+
+### ADASYN
+
+
+```{r}
+
+# fit model
+fit <- naiveBayes(fraud~., data=adasyn_wo_triggers_train)
+
+# summarize the fit
+#print(fit)
+
+# make predictions on test set
+test_prob <- predict(fit, newdata=adasyn_wo_triggers_test %>% dplyr::select(-c("fraud")), type="raw")[,2]
+
+# calculate ROC AUC
+roc_auc <- roc(adasyn_wo_triggers_test$fraud, test_prob)$auc
+
+# calculate PR AUC
+pr_auc <- pr.curve(adasyn_wo_triggers_test$fraud, test_prob)$auc.integral
+
+# set threshold based on optimal ROC curve threshold
+threshold <- coords(roc(adasyn_wo_triggers_test$fraud, test_prob), "best")[[1]]
+
+# make predictions based on threshold
+model_nb_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# confusion matrix
+c1 <- confusionMatrix(adasyn_wo_triggers_test$fraud, as.factor(model_nb_test_pred), mode="everything", positive="1")
+c <- rbind(c, c("NB adasyn_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+```{r}
+
+# fit model
+fit <- naiveBayes(fraud~., data=adasyn_w_triggers_train)
+
+# summarize the fit
+#print(fit)
+
+# make predictions on test set
+test_prob <- predict(fit, newdata=adasyn_w_triggers_test %>% dplyr::select(-c("fraud")), type="raw")[,2]
+
+# calculate ROC AUC
+roc_auc <- roc(adasyn_w_triggers_test$fraud, test_prob)$auc
+
+# calculate PR AUC
+pr_auc <- pr.curve(adasyn_w_triggers_test$fraud, test_prob)$auc.integral
+
+# set threshold based on optimal ROC curve threshold
+threshold <- coords(roc(adasyn_w_triggers_test$fraud, test_prob), "best")[[1]]
+
+# make predictions based on threshold
+model_nb_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# confusion matrix
+c1 <- confusionMatrix(adasyn_w_triggers_test$fraud, as.factor(model_nb_test_pred), mode="everything", positive="1")
+c <- rbind(c, c("NB adasyn_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+### SMOTE
+
+
+```{r}
+
+# fit model
+fit <- naiveBayes(fraud~., data=smote_wo_triggers_train)
+
+# summarize the fit
+#print(fit)
+
+# make predictions on test set
+test_prob <- predict(fit, newdata=smote_wo_triggers_test %>% dplyr::select(-c("fraud")), type="raw")[,2]
+
+# calculate ROC AUC
+roc_auc <- roc(smote_wo_triggers_test$fraud, test_prob)$auc
+
+# calculate PR AUC
+pr_auc <- pr.curve(smote_wo_triggers_test$fraud, test_prob)$auc.integral
+
+# set threshold based on optimal ROC curve threshold
+threshold <- coords(roc(smote_wo_triggers_test$fraud, test_prob), "best")[[1]]
+
+# make predictions based on threshold
+model_nb_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# confusion matrix
+c1 <- confusionMatrix(smote_wo_triggers_test$fraud, as.factor(model_nb_test_pred), mode="everything", positive="1")
+c <- rbind(c, c("NB smote_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+```{r}
+
+# fit model
+fit <- naiveBayes(fraud~., data=smote_w_triggers_train)
+
+# summarize the fit
+#print(fit)
+
+# make predictions on test set
+test_prob <- predict(fit, newdata=smote_w_triggers_test %>% dplyr::select(-c("fraud")), type="raw")[,2]
+
+# calculate ROC AUC
+roc_auc <- roc(smote_w_triggers_test$fraud, test_prob)$auc
+
+# calculate PR AUC
+pr_auc <- pr.curve(smote_w_triggers_test$fraud, test_prob)$auc.integral
+
+# set threshold based on optimal ROC curve threshold
+threshold <- coords(roc(smote_w_triggers_test$fraud, test_prob), "best")[[1]]
+
+# make predictions based on threshold
+model_nb_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# confusion matrix
+c1 <- confusionMatrix(smote_w_triggers_test$fraud, as.factor(model_nb_test_pred), mode="everything", positive="1")
+c <- rbind(c, c("NB smote_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+
+```
+
+
+### MWMOTE
+
+
+```{r}
+
+# fit model
+fit <- naiveBayes(fraud~., data=mwmote_wo_triggers_train)
+
+# summarize the fit
+#print(fit)
+
+# make predictions on test set
+test_prob <- predict(fit, newdata=mwmote_wo_triggers_test %>% dplyr::select(-c("fraud")), type="raw")[,2]
+
+# calculate ROC AUC
+roc_auc <- roc(mwmote_wo_triggers_test$fraud, test_prob)$auc
+
+# calculate PR AUC
+pr_auc <- pr.curve(mwmote_wo_triggers_test$fraud, test_prob)$auc.integral
+
+# set threshold based on optimal ROC curve threshold
+threshold <- coords(roc(mwmote_wo_triggers_test$fraud, test_prob), "best")[[1]]
+
+# make predictions based on threshold
+model_nb_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# confusion matrix
+c1 <- confusionMatrix(mwmote_wo_triggers_test$fraud, as.factor(model_nb_test_pred), mode="everything", positive="1")
+c <- rbind(c, c("NB mwmote_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+
+```
+
+
+```{r}
+
+# fit model
+fit <- naiveBayes(fraud~., data=mwmote_w_triggers_train)
+
+# summarize the fit
+#print(fit)
+
+# make predictions on test set
+test_prob <- predict(fit, newdata=mwmote_w_triggers_test %>% dplyr::select(-c("fraud")), type="raw")[,2]
+
+# calculate ROC AUC
+roc_auc <- roc(mwmote_w_triggers_test$fraud, test_prob)$auc
+
+# calculate PR AUC
+pr_auc <- pr.curve(mwmote_w_triggers_test$fraud, test_prob)$auc.integral
+
+# set threshold based on optimal ROC curve threshold
+threshold <- coords(roc(mwmote_w_triggers_test$fraud, test_prob), "best")[[1]]
+
+# make predictions based on threshold
+model_nb_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# confusion matrix
+c1 <- confusionMatrix(mwmote_w_triggers_test$fraud, as.factor(model_nb_test_pred), mode="everything", positive="1")
+c <- rbind(c, c("NB mwmote_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+
+
+### ROSE
+
+```{r}
+
+
+# fit model
+fit <- naiveBayes(fraud~., data=rose_wo_triggers_train)
+
+# summarize the fit
+#print(fit)
+
+# make predictions on test set
+test_prob <- predict(fit, newdata=rose_wo_triggers_test %>% dplyr::select(-c("fraud")), type="raw")[,2]
+
+# calculate ROC AUC
+roc_auc <- roc(rose_wo_triggers_test$fraud, test_prob)$auc
+
+# calculate PR AUC
+pr_auc <- pr.curve(rose_wo_triggers_test$fraud, test_prob)$auc.integral
+
+# set threshold based on optimal ROC curve threshold
+threshold <- coords(roc(rose_wo_triggers_test$fraud, test_prob), "best")[[1]]
+
+# make predictions based on threshold
+model_nb_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# confusion matrix
+c1 <- confusionMatrix(rose_wo_triggers_test$fraud, as.factor(model_nb_test_pred), mode="everything", positive="1")
+c <- rbind(c, c("NB rose_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+```{r}
+
+# fit model
+fit <- naiveBayes(fraud~., data=rose_w_triggers_train)
+
+# summarize the fit
+#print(fit)
+
+# make predictions on test set
+test_prob <- predict(fit, newdata=rose_w_triggers_test %>% dplyr::select(-c("fraud")), type="raw")[,2]
+
+# calculate ROC AUC
+roc_auc <- roc(rose_w_triggers_test$fraud, test_prob)$auc
+
+# calculate PR AUC
+pr_auc <- pr.curve(rose_w_triggers_test$fraud, test_prob)$auc.integral
+
+# set threshold based on optimal ROC curve threshold
+threshold <- coords(roc(rose_w_triggers_test$fraud, test_prob), "best")[[1]]
+
+# make predictions based on threshold
+model_nb_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# confusion matrix
+c1 <- confusionMatrix(rose_w_triggers_test$fraud, as.factor(model_nb_test_pred), mode="everything", positive="1")
+c <- rbind(c, c("NB rose_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+
+## GBM
+
+### ADASYN
+
+```{r}
+# Fitting model
+
+adasyn_wo_triggers_train$fraud = as.numeric(adasyn_wo_triggers_train$fraud) - 1
+adasyn_wo_triggers_test$fraud = as.numeric(adasyn_wo_triggers_test$fraud) - 1
+
+# Fit the GBM model
+gbm.model <- gbm(fraud ~ ., data = adasyn_wo_triggers_train, distribution = 'bernoulli')
+
+# Testing Set
+test_prob <- predict(gbm.model, newdata = adasyn_wo_triggers_test %>% dplyr::select(-c("fraud")), n.trees = 1000, type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(adasyn_wo_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(adasyn_wo_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_gbm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(as.factor(adasyn_wo_triggers_test$fraud), as.factor(model_gbm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GBM adasyn_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+```
+
+
+
+```{r}
+# Fitting model
+
+adasyn_w_triggers_train$fraud = as.numeric(adasyn_w_triggers_train$fraud) - 1
+adasyn_w_triggers_test$fraud = as.numeric(adasyn_w_triggers_test$fraud) - 1
+
+# Fit the GBM model
+gbm.model <- gbm(fraud ~ ., data = adasyn_w_triggers_train, distribution = 'bernoulli')
+
+# Testing Set
+test_prob <- predict(gbm.model, newdata = adasyn_w_triggers_test %>% dplyr::select(-c("fraud")), n.trees = 1000, type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(adasyn_w_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(adasyn_w_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_gbm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(as.factor(adasyn_w_triggers_test$fraud), as.factor(model_gbm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GBM adasyn_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+```
+
+
+
+
+### SMOTE
+
+```{r}
+# Fitting model
+
+smote_wo_triggers_train$fraud = as.numeric(smote_wo_triggers_train$fraud) - 1
+smote_wo_triggers_test$fraud = as.numeric(smote_wo_triggers_test$fraud) - 1
+
+# Fit the GBM model
+gbm.model <- gbm(fraud ~ ., data = smote_wo_triggers_train, distribution = 'bernoulli')
+
+# Testing Set
+test_prob <- predict(gbm.model, newdata = smote_wo_triggers_test %>% dplyr::select(-c("fraud")), n.trees = 1000, type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(smote_wo_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(smote_wo_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_gbm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(as.factor(smote_wo_triggers_test$fraud), as.factor(model_gbm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GBM smote_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+
+```
+
+
+
+```{r}
+# Fitting model
+
+smote_w_triggers_train$fraud = as.numeric(smote_w_triggers_train$fraud) - 1
+smote_w_triggers_test$fraud = as.numeric(smote_w_triggers_test$fraud) - 1
+
+
+# Fit the GBM model
+gbm.model <- gbm(fraud ~ ., data = smote_w_triggers_train, distribution = 'bernoulli')
+
+# Testing Set
+test_prob <- predict(gbm.model, newdata = smote_w_triggers_test %>% dplyr::select(-c("fraud")), n.trees = 1000, type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(smote_w_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(smote_w_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_gbm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(as.factor(smote_w_triggers_test$fraud), as.factor(model_gbm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GBM smote_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+
+```
+
+
+
+
+### MWMOTE
+
+
+```{r}
+# Fitting model
+
+mwmote_wo_triggers_train$fraud = as.numeric(mwmote_wo_triggers_train$fraud) - 1
+mwmote_wo_triggers_test$fraud = as.numeric(mwmote_wo_triggers_test$fraud) - 1
+
+
+# Fit the GBM model
+gbm.model <- gbm(fraud ~ ., data = mwmote_wo_triggers_train, distribution = 'bernoulli')
+
+# Testing Set
+test_prob <- predict(gbm.model, newdata = mwmote_wo_triggers_test %>% dplyr::select(-c("fraud")), n.trees = 1000, type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(mwmote_wo_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(mwmote_wo_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_gbm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(as.factor(mwmote_wo_triggers_test$fraud), as.factor(model_gbm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GBM mwmote_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+
+```
+
+
+
+```{r}
+# Fitting model
+
+mwmote_w_triggers_train$fraud = as.numeric(mwmote_w_triggers_train$fraud) - 1
+mwmote_w_triggers_test$fraud = as.numeric(mwmote_w_triggers_test$fraud) - 1
+
+
+# Fit the GBM model
+gbm.model <- gbm(fraud ~ ., data = mwmote_w_triggers_train, distribution = 'bernoulli')
+
+# Testing Set
+test_prob <- predict(gbm.model, newdata = mwmote_w_triggers_test %>% dplyr::select(-c("fraud")), n.trees = 1000, type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(mwmote_w_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(mwmote_w_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_gbm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(as.factor(mwmote_w_triggers_test$fraud), as.factor(model_gbm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GBM mwmote_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+
+```
+
+
+
+
+### ROSE
+
+```{r}
+# Fitting model
+
+rose_wo_triggers_train$fraud = as.numeric(rose_wo_triggers_train$fraud) - 1
+rose_wo_triggers_test$fraud = as.numeric(rose_wo_triggers_test$fraud) - 1
+
+
+
+# Fit the GBM model
+gbm.model <- gbm(fraud ~ ., data = rose_wo_triggers_train, distribution = 'bernoulli')
+
+# Testing Set
+test_prob <- predict(gbm.model, newdata = rose_wo_triggers_test %>% dplyr::select(-c("fraud")), n.trees = 1000, type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(rose_wo_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(rose_wo_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_gbm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(as.factor(rose_wo_triggers_test$fraud), as.factor(model_gbm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GBM rose_wo_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+
+```
+
+
+
+```{r}
+# Fitting model
+
+rose_w_triggers_train$fraud = as.numeric(rose_w_triggers_train$fraud) - 1
+rose_w_triggers_test$fraud = as.numeric(rose_w_triggers_test$fraud) - 1
+
+
+# Fit the GBM model
+gbm.model <- gbm(fraud ~ ., data = rose_w_triggers_train, distribution = 'bernoulli')
+
+# Testing Set
+test_prob <- predict(gbm.model, newdata = rose_w_triggers_test %>% dplyr::select(-c("fraud")), n.trees = 1000, type = "response")
+
+# Get the ROC curve and calculate the ROC AUC
+roc_obj <- roc(rose_w_triggers_test$fraud, test_prob)
+roc_auc <- auc(roc_obj)
+
+# Get the PR curve and calculate the PR AUC
+pr_obj <- pr.curve(rose_w_triggers_test$fraud, test_prob)
+pr_auc <- pr_obj$auc.integral
+
+# Set the threshold based on the optimal ROC curve threshold
+threshold <- coords(roc_obj, "best")[[1]]
+model_gbm_test_pred <- ifelse(test_prob > threshold, 1, 0)
+
+# Confusion Matrix
+c1 <- confusionMatrix(as.factor(rose_w_triggers_test$fraud), as.factor(model_gbm_test_pred), mode = "everything", positive = "1")
+c <- rbind(c, c("GBM rose_w_triggers_train", c1$overall[1], c1$byClass[c(1,2,5,6,7)], roc_auc, pr_auc))
+rm(c1)
+
+# Format results dataframe for presentation and analysis
+c = as.data.frame(c)
+colnames(c)[1] = "Method+dataset"
+colnames(c)[8] = "ROC-AUC"
+colnames(c)[9] = "PR-AUC"
+# Calculate F2 score (weighted harmonic mean prioritizing recall over precision)
+c$F2 = 5*as.numeric(c$Precision)*as.numeric(c$Recall)/((4*as.numeric(c$Precision))+as.numeric(c$Recall))
+
+# Display comprehensive comparative results in formatted table
+kable(c , caption = "Comparitive results of ML Models with and w/o triggers")%>%
+  kable_styling(bootstrap_options = "striped", "hover", "condensed", "responsive", full_width = F, position = "center") %>% 
+ row_spec(0, bold = T, color = "black", background = "yellow") %>% 
+ scroll_box( height = "900px",fixed_thead = TRUE)
+
+# Save results for future reference
+write_rds(c,"./results/results.rds")
+
+```
+
+```{r}
+# Extract metric values from nested structures (flattening to single values)
+sapply(c$`Method+dataset`, function(x){x[1]}) -> c$`Method+dataset`
+sapply(c$Accuracy, function(x){x[1]}) -> c$Accuracy
+sapply(c$Sensitivity, function(x){x[1]}) -> c$Sensitivity
+sapply(c$Specificity, function(x){x[1]}) -> c$Specificity
+sapply(c$Precision, function(x){x[1]}) -> c$Precision
+sapply(c$Recall, function(x){x[1]}) -> c$Recall
+sapply(c$F1, function(x){x[1]}) -> c$F1
+sapply(c$`ROC-AUC`,function(x){x[1]}) -> c$`ROC-AUC`
+sapply(c$`PR-AUC`,function(x){x[1]}) -> c$`PR-AUC`
+sapply(c$F2,function(x){x[1]}) -> c$F2
+```
+
+```{r}
+# Finalize results: convert to numeric, create trigger indicator, and parse method names
+c <- 
+  c %>% 
+  mutate(
+    across(.cols = -`Method+dataset`, .fns = as.numeric),
+    trigger = ifelse(stringr::str_detect(`Method+dataset`, "wo"), "N", "Y")
+  ) %>%
+  separate(`Method+dataset`, c("method", "NA_1"), " ", remove = TRUE) %>% 
+  separate(NA_1, c("imbalance", NA, NA))
+
+# Export final comparative results to Excel for analysis and reporting
+writexl::write_xlsx(c, "./results/final_output.xlsx")
+
+```
+

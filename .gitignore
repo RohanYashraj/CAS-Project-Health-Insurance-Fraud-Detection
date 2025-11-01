@@ -1,0 +1,87 @@
+# R
+*.Rproj
+.Rproj.user/
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+*.Rdata
+*.rds
+*.Rds
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# RStudio
+.Rproj.user/
+
+# LaTeX
+*.aux
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+*.out
+*.log
+*.bbl
+*.blg
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Results
+results/*.xlsx
+results/*.rds
+!results/.gitkeep
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Large files
+*.zip
+*.tar.gz
+*.rar
+
+# R Markdown outputs
+*.html
+*.pdf
+# Uncomment if you want to keep final outputs
+# !notebooks/*/final_code.html
+
+# Sensitive data (add patterns as needed)
+*_masked.xlsx
+# Keep structure but not actual data
+!data/external/.gitkeep
+
+# Misc
+*.backup
+*.bak
+
