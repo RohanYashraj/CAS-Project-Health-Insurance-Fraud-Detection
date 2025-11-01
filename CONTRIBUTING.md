@@ -56,10 +56,10 @@ Open and run the main notebook to verify everything works:
 
 ```r
 # Open in RStudio
-file.edit("notebooks/02-modeling/final_code.Rmd")
+file.edit("main.Rmd")
 
 # Or knit from command line
-rmarkdown::render("notebooks/02-modeling/final_code.Rmd")
+rmarkdown::render("main.Rmd")
 ```
 
 ## Project Workflow
@@ -67,7 +67,7 @@ rmarkdown::render("notebooks/02-modeling/final_code.Rmd")
 ### Running the Analysis
 
 1. **Start with cleaned data** in `data/raw/cleaned_input_data.rds`
-2. **Open the main notebook**: `notebooks/02-modeling/final_code.Rmd`
+2. **Open the main notebook**: `main.Rmd`
 3. **Knit the notebook** to run the complete analysis
 4. **Review results** in the `results/` folder
 
