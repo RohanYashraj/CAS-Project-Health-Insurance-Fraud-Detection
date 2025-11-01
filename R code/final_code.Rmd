@@ -79,7 +79,7 @@ library(ROCR)
 ## Loading data and Reducing dimensionality of character columns
 
 ```{r}
-clean_data1 = readRDS("cleaned_input_data.rds")
+clean_data1 = readRDS("../Input_dataset/cleaned_input_data.rds")
 
 ## Considering top 20 unique values from certain columns with large unique values 
 
@@ -341,7 +341,7 @@ source("triggers for package.R")
 ## claim_amount_trigger_map
 
 ```{r}
-trigger_data <- read_excel("trigger_table.xlsx")
+trigger_data <- read_excel("../files_for_trigger_functions/trigger_table.xlsx")
 
 data <- 
   trigger_data %>% 
@@ -436,7 +436,7 @@ data_w_triggers <- claim_reported_delay_trigger_map(claims_file = data_w_trigger
 
 ```{r}
 data <- 
-  read_excel("empanelled_hospitals_list_masked.xlsx") %>% 
+  read_excel("../files_for_trigger_functions/empanelled_hospitals_list_masked.xlsx") %>% 
   janitor::clean_names() %>% 
   dplyr::select(hosp_id)
 
@@ -449,7 +449,7 @@ data_w_triggers <- hospital_empanelled_trigger_map(claims_file = data_w_triggers
 
 ```{r}
 data <- 
-  read_excel("district_distances_masked.xlsx") %>% 
+  read_excel("../files_for_trigger_functions/district_distances_masked.xlsx") %>% 
   tidyr::pivot_longer(cols=-"location_1",
                       names_to = "location_2",
                       values_to = "distance")
@@ -2211,12 +2211,18 @@ sapply(c$F1, function(x){x[1]}) -> c$F1
 sapply(c$`ROC-AUC`,function(x){x[1]}) -> c$`ROC-AUC`
 sapply(c$`PR-AUC`,function(x){x[1]}) -> c$`PR-AUC`
 sapply(c$F2,function(x){x[1]}) -> c$F2
+```
+
+```{r}
 c <- 
   c %>% 
-  mutate(across(.cols = -`Method+dataset`,.vars = as.numeric),
-         trigger = ifelse(stringr::str_detect(`Method+dataset`,"wo"),"N","Y")) %>%
-  separate(`Method+dataset`,c("method","NA_1")," ", remove = TRUE) %>% 
-  separate(NA_1, c("imbalance",NA,NA))
+  mutate(
+    across(.cols = -`Method+dataset`, .fns = as.numeric),
+    trigger = ifelse(stringr::str_detect(`Method+dataset`, "wo"), "N", "Y")
+  ) %>%
+  separate(`Method+dataset`, c("method", "NA_1"), " ", remove = TRUE) %>% 
+  separate(NA_1, c("imbalance", NA, NA))
+
 
 writexl::write_xlsx(c, "final_output.xlsx")
 
