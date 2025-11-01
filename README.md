@@ -177,4 +177,4 @@ For questions or access requests, please contact the project authors.
 
 ---
 
-**Note**: Due to the sensitive nature of fraud detection data, access to the full dataset requires authorization from the project team.
+**Note**: Due to the sensitive nature of fraud detection data, the data has been masked.

@@ -2,15 +2,15 @@
 title: "SSSIHL-CAS: Insurance Fraud Classifier for Health Insurance, a tool for fraud
   detection"
 output:
-  pdf_document:
-    toc: true
-  html_notebook: null
   html_document:
     df_print: paged
     toc: true
     toc_float: true
     collapsed: true
     smooth_scroll: true
+  pdf_document:
+    toc: true
+  html_notebook: null
 ---
 
 <style>
